@@ -1,0 +1,240 @@
+parameters:
+  # App-specific - should come from outside!
+  - name: ProjectName
+    type: string
+    default: ''
+  - name: ProjectPath
+    type: string
+    default: ''
+  - name: DockerSonarServerImage
+    type: string
+    default: 'sonarqube:latest'
+  - name: DockerSonarServerInstanceName
+    type: string
+    default: 'sonar-server'
+  - name: DockerSonarServerInstancePort
+    type: string
+    default: '9234'
+  - name: DockerNetworkName
+    type: string
+    default: 'sonarqube'
+  - name: SonarExtensionsDir
+    type: string
+    default: 'sonarless/extensions'
+
+variables:
+  system.debug: 'true'
+
+stages:
+- stage: Scan
+  displayName: Scan
+
+  jobs:
+  - job: Scan
+    displayName: Scan
+    workspace:
+      clean: all  # see https://learn.microsoft.com/en-us/azure/devops/pipelines/process/phases?view=azure-devops&tabs=yaml#workspace
+    pool:
+      vmImage: 'ubuntu-latest'
+    variables:
+      ProjectPath: $(System.DefaultWorkingDirectory)/${{parameters.ProjectPath}}
+      SonarOutputFolder: '${{variables.ProjectPath}}/.sonar'
+      SonarMetricsPath: '${{variables.ProjectPath}}/.sonar/sonar-metrics.json'
+      Username: 'admin'
+      OldPassword: 'admin'
+      Password: 'abcDEFG_S123'  # Password must be at least 12 characters long, Password must contain at least one uppercase character, Password must contain at least one special character
+      Credentials: '${{variables.Username}}:${{variables.Password}}'
+
+    steps:
+    - checkout: self
+      clean: true # this might be redundant due to the workspace/clean = all above, but should not hurt
+      fetchDepth: 1 # see https://stackoverflow.com/questions/61138832/improve-azure-pipeline-performance-by-reducing-checkout-time
+      fetchTags: false  # see https://learn.microsoft.com/en-us/azure/devops/pipelines/yaml-schema/steps-checkout?view=azure-pipelines#sync-tags
+
+     - bash: |
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        echo "DONE: curl -fsSL https://get.docker.com -o get-docker.sh"
+        sudo sh get-docker.sh
+        echo "DONE: sudo sh get-docker.sh"
+        sudo chmod 666 /var/run/docker.sock
+        echo "DONE: chmod 666 /var/run/docker.sock"
+      displayName: 'Install Docker'
+      condition: succeeded()
+
+    - bash: |
+        if ! docker network inspect "${{parameters.DockerNetworkName}}" > /dev/null 2>&1; then
+            echo "Creating Docker network ${{parameters.DockerNetworkName}} ..."
+            docker network create "${{parameters.DockerNetworkName}}" > /dev/null 2>&1
+            echo "Docker network ${{parameters.DockerNetworkName}} created"
+        else
+            echo "Docker network ${{parameters.DockerNetworkName}} already exists"
+        fi
+      displayName: Create docker network
+      condition: succeeded()
+
+    - bash: |
+        if ! docker inspect "${{parameters.DockerSonarServerInstanceName}}" > /dev/null 2>&1; then
+                docker run -d --name "${{parameters.DockerSonarServerInstanceName}}" -p "${{parameters.DockerSonarServerInstancePort}}:9000" --network "${{parameters.DockerNetworkName}}"  \
+                    "${{parameters.DockerSonarServerImage}}" # > /dev/null 2>&1
+                    # -v "$(System.DefaultWorkingDirectory)/${{parameters.SonarExtensionsDir}}:/opt/sonarqube/extensions/plugins" \
+                    # -v "$(System.DefaultWorkingDirectory)/${{parameters.SonarExtensionsDir}}:/usr/local/bin" \
+                echo "docker run ${{parameters.DockerSonarServerInstanceName}}"
+        else
+            docker start "${{parameters.DockerSonarServerInstanceName}}" # > /dev/null 2>&1
+            echo "docker start ${{parameters.DockerSonarServerInstanceName}}"
+        fi
+      displayName: Docker run/start sonar-server
+      condition: succeeded()
+
+    - bash: |
+        sudo apt install -y jq
+      displayName: Install jq
+      condition: succeeded()
+
+    - bash: |
+        echo "Booting SonarQube docker instance ${{parameters.DockerSonarServerInstanceName}} ..."
+        for _ in $(seq 1 60); do
+            sleep 1
+            printf .
+            HTTP_CODE=$(curl -k -s -o /dev/null -I -w "%{http_code}" -H 'User-Agent: Mozilla/6.0' "http://localhost:${{parameters.DockerSonarServerInstancePort}}" 2>/dev/null || true) # || true suppresses the error for this command, so that the script does not exit here due to the global flag "set -e"
+            if [[ "${HTTP_CODE}" == "200" ]] && EXIT_CODE=0 || EXIT_CODE=-1; then
+                echo "SonarQube docker instance ${{parameters.DockerSonarServerInstanceName}} is reachable via HTTP"
+                break
+            fi
+        done
+
+        if [[ "$counter" == 180 ]]; then
+            echo "SonarQube docker instance ${{parameters.DockerSonarServerInstanceName}} is NOT reachable via HTTP, exiting"
+            docker logs -f "${{parameters.DockerSonarServerInstanceName}}"
+            exit 1
+        fi
+
+        echo 'Waiting for SonarQube docker instance ${{parameters.DockerSonarServerInstanceName}} status to be "UP" ...'
+        for counter in $(seq 1 180); do
+            sleep 1
+            printf .
+            status_value=$(curl -s "http://localhost:${{parameters.DockerSonarServerInstancePort}}/api/system/status" 2>/dev/null | jq -r '.status' || true)   # || true suppresses the error for this command, so that the script does not exit here due to the global flag "set -e"
+
+            # Check if the status value is "running"
+            if [[ "$status_value" == "UP" ]]; then
+                echo "SonarQube docker instance ${{parameters.DockerSonarServerInstanceName}} status is $status_value"
+                break
+            fi
+        done
+
+        if [[ "$counter" == 180 ]]; then
+            echo "SonarQube docker instance ${{parameters.DockerSonarServerInstanceName}} status is NOT UP but $status_value, exiting"
+            docker logs -f "${{parameters.DockerSonarServerInstanceName}}"
+            exit 1
+        fi
+      displayName: Wait for ${{parameters.DockerSonarServerInstanceName}} to start
+
+    - bash: |
+        echo "Resetting ${{variables.Username}} password to ${{variables.Password}} (otherwise user is asked to change default password)..."
+        curl -s -X POST -u "admin:admin" \
+            -d "login=${{variables.Username}}&previousPassword=${{variables.OldPassword}}&password=${{variables.Password}}" \
+            "http://localhost:${{parameters.DockerSonarServerInstancePort}}/api/users/change_password"
+        echo "Local SonarQube URI: http://localhost:${{parameters.DockerSonarServerInstancePort}}"
+        echo "Credentials: ${{variables.Credentials}}"
+      displayName: Reset admin password
+      condition: succeeded()
+
+    - task: UseNode@1
+      inputs:
+        version: '22.x'
+
+    - bash: |
+        echo "Creating default project and set default fav ..."
+        curl -s -u "${{variables.Credentials}}" -X POST "http://localhost:${{parameters.DockerSonarServerInstancePort}}/api/projects/create?name=${{parameters.ProjectName}}&project=${{parameters.ProjectName}}" | jq
+        curl -s -u "${{variables.Credentials}}" -X POST "http://localhost:${{parameters.DockerSonarServerInstancePort}}/api/users/set_homepage?type=PROJECT&component=${{parameters.ProjectName}}"
+
+        echo "Creating token and scan using internal-ip because of docker to docker communication"
+        curl -s -X POST -u "${{variables.Credentials}}" "http://localhost:${{parameters.DockerSonarServerInstancePort}}/api/user_tokens/generate?name=$(date +%s%N)"
+        SONAR_TOKEN=$(curl -s -X POST -u "${{variables.Credentials}}" "http://localhost:${{parameters.DockerSonarServerInstancePort}}/api/user_tokens/generate?name=$(date +%s%N)" | jq -r .token)
+        echo "SONAR_TOKEN=$SONAR_TOKEN"
+
+        echo "Running scan using Sonar Scanner for NPM"
+        pushd ${{variables.ProjectPath}}
+        npm install
+        npx -y sonarqube-scanner -Dsonar.host.url="http://localhost:${{parameters.DockerSonarServerInstancePort}}" -Dsonar.token="$SONAR_TOKEN" -Dsonar.projectKey="${{parameters.ProjectName}}"
+        popd
+      displayName: Scan project
+      condition: succeeded()
+
+    - bash: |
+        mkdir -p ${{variables.SonarOutputFolder}}
+        echo "Output folder ${{variables.SonarOutputFolder}} created"
+      displayName: Create output folder for scan results
+      condition: succeeded()
+
+    - bash: |
+        echo "Collecting scan results via the Web API ..."
+
+        SLEEP_SECONDS=10
+        echo "Sleeping $SLEEP_SECONDS seconds to let SonarQube finish processing the scan results ..."
+        sleep $SLEEP_SECONDS
+
+        curl -s -u "${{variables.Credentials}}" "http://localhost:${{parameters.DockerSonarServerInstancePort}}/api/measures/component?component=${{parameters.ProjectName}}&metricKeys=bugs,vulnerabilities,code_smells,quality_gate_details,violations,duplicated_lines_density,ncloc,coverage,reliability_rating,security_rating,security_review_rating,sqale_rating,security_hotspots,open_issues" \
+            | jq -r > ${{variables.SonarMetricsPath}}
+        echo "Scan results written to ${{variables.SonarMetricsPath}}"
+        cat ${{variables.SonarMetricsPath}}
+      displayName: Collect scan results via the Web API
+      condition: succeeded()
+
+    - publish: ${{variables.SonarOutputFolder}}/sonar-metrics.json
+      artifact: ${{parameters.ProjectName}}_sonar-metrics.json
+      displayName: 'Publish ${{parameters.ProjectName}}_sonar-metrics.json'
+      condition: succeeded()
+
+    - bash: |
+        echo "Installing Playwright ..."
+        pushd deploy/Sonar
+        npm install
+        npx playwright install --with-deps # --no-shell
+        echo "Collecting scan results via the Web UI ..."
+        npm install typescript #--save-dev
+        npx tsc save_mhtml.ts
+        node save_mhtml.js --projectName ${{parameters.ProjectName}} --outputFolder ${{variables.SonarOutputFolder}}
+        popd
+      displayName: Collect scan results via the Web UI
+      condition: succeeded()
+
+    - publish: ${{variables.SonarOutputFolder}}/${{parameters.ProjectName}}_overview.mhtml
+      displayName: 'Publish ${{parameters.ProjectName}}_overview.mhtml'
+      artifact: ${{parameters.ProjectName}}_overview.mhtml
+
+    - publish: ${{variables.SonarOutputFolder}}/${{parameters.ProjectName}}_issues.mhtml
+      artifact: ${{parameters.ProjectName}}_issues.mhtml
+      displayName: 'Publish ${{parameters.ProjectName}}_issues.mhtml'
+      condition: succeeded()
+
+    - publish: ${{variables.SonarOutputFolder}}/${{parameters.ProjectName}}_security_hotspots.mhtml
+      artifact: ${{parameters.ProjectName}}_security_hotspots.mhtml
+      displayName: 'Publish ${{parameters.ProjectName}}_security_hotspots.mhtml'
+      condition: succeeded()
+
+    - bash: |
+        docker stop "${{parameters.DockerSonarServerInstanceName}}" > /dev/null 2>&1
+        echo "Local SonarQube docker instance \"${{parameters.DockerSonarServerInstanceName}}\" has been stopped"
+        docker rm -f "${{parameters.DockerSonarServerInstanceName}}"
+        echo "Local SonarQube docker instance \"${{parameters.DockerSonarServerInstanceName}}\" has been removed"
+        # docker image rm -f "${{parameters.DockerSonarServerImage}}"
+        # echo "Docker image ${{parameters.DockerSonarServerImage}} has been removed"
+        docker volume prune -a -f
+        echo "Docker volumes have been pruned"
+        docker network rm -f "${{parameters.DockerNetworkName}}"
+        echo "Docker network ${{parameters.DockerNetworkName}} has been removed"
+      displayName: Clean up docker
+      condition: always()
+
+    - bash: |
+        echo "Checking SonarQube metrics ..."
+        vulnerabilities=$(cat ${{variables.SonarMetricsPath}} | jq -r '.component.measures[] | select(.metric == "vulnerabilities") | .value')
+        if [[ "$vulnerabilities" -gt 0 ]]; then
+            echo "Vulnerabilities found: $vulnerabilities"
+            exit 1
+        else
+            echo "No vulnerabilities found"
+        fi
+      displayName: Check SonarQube Metrics
+      condition: succeeded()

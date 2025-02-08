@@ -1,0 +1,25 @@
+trigger: none
+
+schedules:
+  - cron: '0 3 * * *'
+    displayName: Daily Scan
+    always: true
+    branches:
+      include:
+        - main
+
+parameters:
+  - name: ProjectName
+    displayName: 'Project Name'
+    type: string
+    default: 'App1'
+  - name: ProjectPath
+    displayName: 'Project Path'
+    type: string
+    default: 'app1'
+
+extends:
+  template: /sonar/ado-pipeline-template-sonar-scan.yml
+  parameters:
+    ProjectName: ${{ parameters.ProjectName }}
+    ProjectPath: ${{ parameters.ProjectPath }}
